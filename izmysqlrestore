@@ -1,0 +1,274 @@
+#!/bin/bash
+NAME="izMySQLRestore"
+DESCRIPTION="MySQL database dump restore script"
+AUTHOR="Christopher Viola <c.viola@wearequantico.it>"
+
+VERSION="1.0.1"
+VERSION_DATE="20220711"
+
+src_file=""
+dst_uri=""
+log_table="logs"
+keep_logs=0
+keep_logs_op=0
+sed_pattern=""
+
+now="$(date +"%Y%m%d-%H%M%S")"
+izmysqlrestore_dst_cfg="/tmp/izmysqlrestore-dst-$now.cfg"
+
+function log() {
+        echo "$(date +"[%Y/%m/%d %H:%M:%S]")$1 "
+}
+
+#
+# URI parsing function
+#
+# The function creates global variables with the parsed results.
+# It returns 0 if parsing was successful or non-zero otherwise.
+#
+# [schema://][user[:password]@]host[:port][/path][?[arg1=val1]...][#fragment]
+#
+# thanks to: https://wp.vpalos.com/537/uri-parsing-using-bash-built-in-features/
+function uri_parser() {
+    # uri capture
+    uri="$@"
+
+    # safe escaping
+    uri="${uri//\`/%60}"
+    uri="${uri//\"/%22}"
+
+    # top level parsing
+    pattern='^(([a-z]{3,5}):\/\/)?((([^:\/]+)(:([^@\/]*))?@)?([^:\/?]+)(:([0-9]+))?)(\/[^?]*)?(\?[^#]*)?(#.*)?$'
+    [[ "$uri" =~ $pattern ]] || return 1;
+
+    # component extraction
+    uri=${BASH_REMATCH[0]}
+    uri_schema=${BASH_REMATCH[2]}
+    uri_address=${BASH_REMATCH[3]}
+    uri_username=${BASH_REMATCH[5]}
+    uri_password=${BASH_REMATCH[7]}
+    uri_host=${BASH_REMATCH[8]}
+    uri_port=${BASH_REMATCH[10]}
+    uri_path=${BASH_REMATCH[11]}
+    uri_query=${BASH_REMATCH[12]}
+    uri_fragment=${BASH_REMATCH[13]}
+
+    # path parsing
+    count=0
+    path="$uri_path"
+    pattern='^/+([^/]+)'
+    while [[ $path =~ $pattern ]]; do
+        eval "uri_parts[$count]=\"${BASH_REMATCH[1]}\""
+        path="${path:${#BASH_REMATCH[0]}}"
+        let count++
+    done
+
+    # query parsing
+    count=0
+    query="$uri_query"
+    pattern='^[?&]+([^= ]+)(=([^&]*))?'
+    while [[ $query =~ $pattern ]]; do
+        eval "uri_args[$count]=\"${BASH_REMATCH[1]}\""
+        eval "uri_arg_${BASH_REMATCH[1]}=\"${BASH_REMATCH[3]}\""
+        query="${query:${#BASH_REMATCH[0]}}"
+        let count++
+    done
+
+    # return success
+    return 0
+}
+
+function uri_unset() {
+  unset uri uri_schema uri_address uri_username uri_password uri_host uri_port uri_path uri_query uri_fragment count query pattern
+}
+
+print_mysql_client_cfg_dst() {
+  echo "[client]
+host=$dst_host
+port=$dst_port
+user=$dst_username
+$([ ! -z $dst_password ] && echo password=$dst_password)"
+}
+
+__usage="$NAME - $DESCRIPTION
+written by $AUTHOR
+version: $VERSION - released: $VERSION_DATE
+
+Usage: $(basename $0) -f [FILENAME] -d [DESTINATION] [OPTIONS]
+
+Options:
+  -f, --file                    Nome del file di backup, estensione .sql oppure .bz2
+  -d, --destination             URL del server mysql e database su cui importare i dati
+  -k, --keep-logs               Se settato non elimina gli INSERT sulla tabella dei log
+      --log-table               Nome della tabella dei log (default: logs)
+      --keep-logs-op            Se settato non elimina gli INSERT sulla tabella LOGOPERAZIONI
+  -h, --help                    Mostra questo help
+
+Example:
+  $ $0 -f backup-reacto-database-reacto_quantico-20220711-010000.sql.bz2 -d mysql://root:Str0NGPASSWord@morfeo:3307/reacto_quantico
+
+"
+
+usage() {
+    echo "$__usage";
+}
+
+while [ "$1" != "" ]; do
+    case $1 in
+        -f | --file )           shift
+                                src_file=$1
+                                ;;
+        -d | --destination )    shift
+                                dst_uri=$1
+                                ;;
+        -k | --keep-logs )      keep_logs=1
+                                ;;
+        --log-table )           shift
+                                log_table=$1
+                                ;;
+        -h | --help )           usage
+                                exit
+                                ;;
+        --keep-logs-op )        keep_logs_op=1
+                                ;;
+        * )                     usage
+                                exit 1
+                                ;;
+    esac
+    shift
+done
+
+if [[ $src_file = "" ]]; then
+    echo "src_file è un parametro obbligatorio."
+    echo
+    usage
+    exit 1
+fi
+
+if [[ $dst_uri = "" ]]; then
+    echo "dst_uri è un parametro obbligatorio."
+    echo
+    usage
+    exit 1
+fi
+
+if [[ ! -f $src_file ]]; then
+    echo "File non valido."
+    exit 1
+fi
+
+if [[ $src_file == *.bz2 ]]; then
+    bunzip2 -f -k $src_file
+    status="$?"
+    if [[ $status -ne 0 ]]; then
+        echo "Errore durante l'estrazione del file."
+        exit 1
+    fi
+    #tolgo .bz2 dal nome file
+    src_file=${src_file%.*}
+fi
+
+if [[ $src_file != *.sql ]]; then
+    echo "Sono supportati solo files .SQL"
+    exit 1
+fi
+
+# parse dst_uri database URI
+  uri_parser $dst_uri
+  dst_host="$uri_host"
+  dst_port="$uri_port"
+  dst_username="$uri_username"
+  dst_password="$uri_password"
+  dst_db="$(echo "$uri_path" | sed 's|^/||')"
+
+  # dst default vars
+  : ${dst_uri:=""}
+  : ${dst_host:=""}
+  : ${dst_username:="$USER"}
+  : ${dst_password:=""}
+  : ${dst_port:="3306"}
+  uri_unset
+
+sed_pattern+=" -e 's/DEFINER=\`([^\`]+?)\`@\`([^\`]+?)\`/DEFINER=CURRENT_USER/g'"
+sed_pattern+=" -e 's/,NO_AUTO_CREATE_USER//g'"
+
+# remove references to the original db
+sed_pattern+=" -e '/DROP DATABASE/d'"
+sed_pattern+=" -e '/^CREATE DATABASE/d'"
+sed_pattern+=" -e '/^USE \`(.*)\`.*;/d'"
+
+# make references to the new db
+sed_pattern+=" -e '1s/^/USE \`$dst_db\`;\n/'"
+sed_pattern+=" -e '1s/^/CREATE DATABASE \`$dst_db\`;\n/'"
+sed_pattern+=" -e '1s/^/DROP DATABASE IF EXISTS \`$dst_db\`;\n/'"
+
+
+## old method
+#sed_pattern+=" -e 's/^DROP DATABASE.*;/DROP DATABASE IF EXIST \`$dst_db\`/gI'"
+#sed_pattern+=" -e 's/^CREATE DATABASE.*;/CREATE DATABASE \`$dst_db\`;/gI'"
+#sed_pattern+=" -e 's/^USE \`(.*)\`;/USE \`$dst_db\`;/gI'"
+
+manage_logs() {
+start_logs=-1
+rm_log=""
+# rimuovo i logs (solo i dati non la struttura della tabella)
+if [[ $keep_logs -eq 0 ]]; then
+    start_logs=$(grep -inE "insert into .$log_table. " "$src_file" | head -n 1 | cut -d: -f1)
+    if [[ $start_logs -gt 0 ]]; then
+        end_logs=$(grep -inE "insert into .$log_table. " "$src_file" | tail -n 1 | cut -d: -f1)
+        rm_log="{$start_logs,$end_logs d}"
+    fi
+fi
+start_logs_op=-1
+rm_log_op=""
+# rimuovo i log operazioni (solo i dati non la struttura della tabella)
+if [[ $keep_logs_op -eq 0 ]]; then
+    start_logs_op=$(grep -inE "insert into .LOGOPERAZIONI." "$src_file" | head -n 1 | cut -d: -f1)
+    if [[ $start_logs_op -gt 0 ]]; then
+        end_logs=$(grep -inE "insert into .LOGOPERAZIONI." "$src_file" | tail -n 1 | cut -d: -f1)
+        rm_log_op="{$start_logs_op,$end_logs d}"
+    fi
+fi
+
+if [[ $start_logs -gt 0 && $start_logs_op -gt 0 ]]; then
+    if [[ $start_logs -gt $start_logs_op ]]; then
+        sed_pattern+=" -e '$rm_log'"
+        sed_pattern+=" -e '$rm_log_op'"
+    else
+        sed_pattern+=" -e '$rm_log_op'"
+        sed_pattern+=" -e '$rm_log'"
+    fi
+elif [[ $start_logs -gt 0 ]]; then
+    sed_pattern+=" -e '$rm_log'"
+elif [[ $start_logs_op -gt 0 ]]; then
+    sed_pattern+=" -e '$rm_log_op'"
+fi
+}
+
+manage_logs
+
+src_file_clean="clean_${src_file}"
+[ -f $src_file_clean ] && rm -f "$src_file_clean"
+
+# clean the dump file before importing
+eval sed -E ${sed_pattern} "${src_file}" > "$src_file_clean"
+
+  echo "$(log) ----------------------------------------------"
+  echo "           SOURCE:[$src_file_clean]"
+  echo "      DESTINATION:[$dst_uri]"
+  echo "      SED PATTERN:[$sed_pattern]"
+  echo
+  echo " --> ATTENZIONE: Se il database '$dst_db' esiste già, sarà DROPPATO prima di iniziare l'import dei file."
+  echo "                 Quindi procedere con cautela ed accertarsi che il database di destinazione non esiste o sia cancellabile"
+  echo
+  echo "$(log) ----------------------------------------------"
+  echo -e -n "Press ENTER to continue (CTRL-C to abort)"; read -n 1 ; echo
+  echo "$(log) ----------------------------------------------"
+
+
+print_mysql_client_cfg_dst > "$izmysqlrestore_dst_cfg"
+
+# import the dump file
+cat "${src_file_clean}" | mysql --defaults-extra-file=$izmysqlrestore_dst_cfg -f
+
+trap "rm -f ${izmysqlsync_src_cfg}" 0
