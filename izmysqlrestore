@@ -3,8 +3,8 @@ NAME="izMySQLRestore"
 DESCRIPTION="MySQL database dump restore script"
 AUTHOR="Christopher Viola <c.viola@wearequantico.it>"
 
-VERSION="1.0.1"
-VERSION_DATE="20220711"
+VERSION="1.0.2"
+VERSION_DATE="20240412"
 
 src_file=""
 dst_uri=""
@@ -196,6 +196,7 @@ sed_pattern+=" -e 's/,NO_AUTO_CREATE_USER//g'"
 sed_pattern+=" -e '/DROP DATABASE/d'"
 sed_pattern+=" -e '/^CREATE DATABASE/d'"
 sed_pattern+=" -e '/^USE \`(.*)\`.*;/d'"
+sed_pattern+=" -e 's/ALTER DATABASE \`$src_db\`/ALTER DATABASE \`$dst_db\`/g'"
 
 # make references to the new db
 sed_pattern+=" -e '1s/^/USE \`$dst_db\`;\n/'"
@@ -259,7 +260,7 @@ eval sed -E ${sed_pattern} "${src_file}" > "$src_file_clean"
   echo "      SED PATTERN:[$sed_pattern]"
   echo
   echo " --> ATTENZIONE: Se il database '$dst_db' esiste già, sarà DROPPATO prima di iniziare l'import dei file."
-  echo "                 Quindi procedere con cautela ed accertarsi che il database di destinazione non esiste o sia cancellabile"
+  echo "                 Quindi procedere con cautela ed accertarsi che il database di destinazione non esista o sia cancellabile"
   echo
   echo "$(log) ----------------------------------------------"
   echo -e -n "Press ENTER to continue (CTRL-C to abort)"; read -n 1 ; echo
